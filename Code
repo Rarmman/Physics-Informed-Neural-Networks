@@ -1,0 +1,297 @@
+import numpy as np
+import torch
+import torch.nn as nn
+import matplotlib.pyplot as plt
+from matplotlib.gridspec import GridSpec
+
+#Reproducibility
+torch.manual_seed(42)
+np.random.seed(42)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+#Hyperparameters
+ALPHA        = 0.01          # thermal diffusivity
+N_COLLOC     = 1000         # interior collocation points
+N_BC         = 200           # boundary (x=0, x=1) points each side
+N_IC         = 200           # initial condition (t=0) points
+EPOCHS       = 20000
+LR           = 1e-3
+HIDDEN_SIZE  = 64
+N_LAYERS     = 4             # hidden layers
+
+#Neural Network
+class PINN(nn.Module):
+    """4-layer fully-connected network, tanh activations."""
+
+    def __init__(self, hidden: int = 64, n_hidden_layers: int = 4):
+        super().__init__()
+        layers = [nn.Linear(2, hidden), nn.Tanh()]
+        for _ in range(n_hidden_layers - 1):
+            layers += [nn.Linear(hidden, hidden), nn.Tanh()]
+        layers.append(nn.Linear(hidden, 1))
+        self.net = nn.Sequential(*layers)
+
+        # Xavier initialisation for faster convergence
+        for m in self.net:
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight)
+                nn.init.zeros_(m.bias)
+
+    def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        xt = torch.cat([x, t], dim=1)   # (N, 2)
+        return self.net(xt)             # (N, 1)
+
+
+#Dataset Generation
+def make_dataset():
+
+    #Collocation (interior, no labels for these points)
+    x_col = torch.FloatTensor(N_COLLOC, 1).uniform_(0, 1).to(device)
+    t_col = torch.FloatTensor(N_COLLOC, 1).uniform_(0, 1).to(device)
+
+    #Boundary (x=0 and x=1)
+    t_bc_vals = torch.FloatTensor(N_BC * 2, 1).uniform_(0, 1).to(device)
+    x_bc_vals = torch.cat([
+        torch.zeros(N_BC, 1),   # x = 0
+        torch.ones(N_BC, 1),    # x = 1
+    ]).to(device)
+    u_bc_vals = torch.zeros(N_BC * 2, 1).to(device)   # u = 0 on both walls
+
+    #Initial condition (t=0)
+    x_ic_vals = torch.FloatTensor(N_IC, 1).uniform_(0, 1).to(device)
+    t_ic_vals = torch.zeros(N_IC, 1).to(device)
+    u_ic_vals = torch.sin(np.pi * x_ic_vals).to(device)
+
+    return (x_col, t_col,
+            x_bc_vals, t_bc_vals, u_bc_vals,
+            x_ic_vals, t_ic_vals, u_ic_vals)
+
+
+#Physics based PDE residual using autograd
+def pde_residual(model: PINN,
+                 x: torch.Tensor,
+                 t: torch.Tensor) -> torch.Tensor:
+
+    x = x.requires_grad_(True)
+    t = t.requires_grad_(True)
+
+    u = model(x, t)   #(N,1)
+
+    # First-order partial derivatives
+    u_t = torch.autograd.grad(u, t,
+                               grad_outputs=torch.ones_like(u),
+                               create_graph=True)[0]
+
+    u_x = torch.autograd.grad(u, x,
+                               grad_outputs=torch.ones_like(u),
+                               create_graph=True)[0]
+
+    # Second-order spatial derivative
+    u_xx = torch.autograd.grad(u_x, x,
+                                grad_outputs=torch.ones_like(u_x),
+                                create_graph=True)[0]
+
+    residual = u_t - ALPHA * u_xx  # should be approximately 0
+    return residual
+
+#Training
+def train():
+    model = PINN(hidden=HIDDEN_SIZE, n_hidden_layers=N_LAYERS).to(device)
+    optimiser = torch.optim.Adam(model.parameters(), lr=LR)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimiser,
+                                                  step_size=5_000,
+                                                  gamma=0.5)
+    mse = nn.MSELoss()
+
+    (x_col, t_col,
+     x_bc,  t_bc,  u_bc,
+     x_ic,  t_ic,  u_ic) = make_dataset()
+
+    history = {"total": [], "pde": [], "bc": [], "ic": []}
+
+    for epoch in range(1, EPOCHS + 1):
+        optimiser.zero_grad()
+
+        #Physics loss
+        res = pde_residual(model, x_col, t_col)
+        loss_pde = mse(res, torch.zeros_like(res))
+
+        #Boundary loss
+        u_pred_bc = model(x_bc, t_bc)
+        loss_bc   = mse(u_pred_bc, u_bc)
+
+        #Initial condition loss
+        u_pred_ic = model(x_ic, t_ic)
+        loss_ic   = mse(u_pred_ic, u_ic)
+
+        #Total (equal weights)
+        loss = loss_pde + loss_bc + loss_ic
+        loss.backward()
+        optimiser.step()
+        scheduler.step()
+
+        if epoch % 500 == 0 or epoch == 1:
+            history["total"].append(loss.item())
+            history["pde"].append(loss_pde.item())
+            history["bc"].append(loss_bc.item())
+            history["ic"].append(loss_ic.item())
+            print(f"Epoch {epoch:6d} | "
+                  f"Total {loss.item():.2e} | "
+                  f"PDE {loss_pde.item():.2e} | "
+                  f"BC {loss_bc.item():.2e} | "
+                  f"IC {loss_ic.item():.2e}")
+
+    return model, history
+
+
+#Evaluation - Relative L2 error on uniform grid is calculated
+def evaluate(model: PINN, n_x: int = 100, n_t: int = 100):
+    """
+    A uniform n_x x n_t grid is built. The network is run on the grid and compared to the analytical solution
+    """
+    x_vals = np.linspace(0, 1, n_x)
+    t_vals = np.linspace(0, 1, n_t)
+    X, T = np.meshgrid(x_vals, t_vals)   # (n_t, n_x)
+
+    x_flat = torch.FloatTensor(X.ravel()).unsqueeze(1).to(device)
+    t_flat = torch.FloatTensor(T.ravel()).unsqueeze(1).to(device)
+
+    model.eval()
+    with torch.no_grad():
+        u_pred = model(x_flat, t_flat).cpu().numpy().reshape(n_t, n_x)
+
+    u_exact = np.sin(np.pi * X) * np.exp(-ALPHA * np.pi**2 * T)
+
+    # Relative L2 error
+    rel_l2 = (np.linalg.norm(u_pred - u_exact) /
+               np.linalg.norm(u_exact)) * 100  #percent
+
+    print(f"\nRelative L2 error on {n_x}×{n_t} uniform grid: {rel_l2:.4f}%")
+    return x_vals, t_vals, X, T, u_pred, u_exact, rel_l2
+
+#Visualization
+def plot_results(x_vals, t_vals, X, T, u_pred, u_exact, history, rel_l2):
+    fig = plt.figure(figsize=(18, 12))
+    fig.patch.set_facecolor("#0d1117")
+    gs  = GridSpec(2, 3, figure=fig, hspace=0.40, wspace=0.35)
+
+    CMAP  = "inferno"
+    TCOL  = "#e6edf3"
+    ACOL  = "#58a6ff"
+    ECOL  = "#f78166"
+
+    def style_ax(ax, title):
+        ax.set_facecolor("#161b22")
+        ax.set_title(title, color=TCOL, fontsize=11, pad=8)
+        ax.tick_params(colors=TCOL, labelsize=8)
+        for spine in ax.spines.values():
+            spine.set_edgecolor("#30363d")
+
+    #(a) Exact solution
+    ax0 = fig.add_subplot(gs[0, 0])
+    c0 = ax0.contourf(X, T, u_exact, levels=50, cmap=CMAP)
+    plt.colorbar(c0, ax=ax0).ax.tick_params(colors=TCOL, labelsize=7)
+    ax0.set_xlabel("x", color=TCOL, fontsize=9)
+    ax0.set_ylabel("t", color=TCOL, fontsize=9)
+    style_ax(ax0, "Analytical  u(x,t)")
+
+    #(b) PINN prediction
+    ax1 = fig.add_subplot(gs[0, 1])
+    c1 = ax1.contourf(X, T, u_pred, levels=50, cmap=CMAP)
+    plt.colorbar(c1, ax=ax1).ax.tick_params(colors=TCOL, labelsize=7)
+    ax1.set_xlabel("x", color=TCOL, fontsize=9)
+    ax1.set_ylabel("t", color=TCOL, fontsize=9)
+    style_ax(ax1, "PINN Prediction  u_hat(x,t)")
+
+    #(c) Point-wise absolute error
+    ax2 = fig.add_subplot(gs[0, 2])
+    err_map = np.abs(u_pred - u_exact)
+    c2 = ax2.contourf(X, T, err_map, levels=50, cmap="hot")
+    plt.colorbar(c2, ax=ax2).ax.tick_params(colors=TCOL, labelsize=7)
+    ax2.set_xlabel("x", color=TCOL, fontsize=9)
+    ax2.set_ylabel("t", color=TCOL, fontsize=9)
+    style_ax(ax2, f"|Exact − PINN|   (L2 err = {rel_l2:.2f}%)")
+
+
+    #(d) Spatial profile slices
+    ax3 = fig.add_subplot(gs[1, 0:2])
+    style_ax(ax3, "Spatial Profile  u(x, t*)  at Selected Time Slices")
+    t_slices = [0.0, 0.1, 0.25, 0.5, 1.0]
+    palette  = plt.cm.cool(np.linspace(0.15, 0.95, len(t_slices)))
+    for t_star, col in zip(t_slices, palette):
+        idx = np.argmin(np.abs(t_vals - t_star))
+        ax3.plot(x_vals, u_exact[idx], color=col, lw=2,
+                 label=f"t={t_star:.2f} (exact)")
+        ax3.plot(x_vals, u_pred[idx],  color=col, lw=1.5,
+                 linestyle="--", alpha=0.85)
+    ax3.plot([], [], "w--", lw=1.5, label="PINN (dashed)")
+    ax3.set_xlabel("x", color=TCOL, fontsize=9)
+    ax3.set_ylabel("u", color=TCOL, fontsize=9)
+    leg = ax3.legend(fontsize=7, facecolor="#161b22", edgecolor="#30363d",
+                     labelcolor=TCOL, ncol=3)
+
+    #(e) Training loss history
+    ax4 = fig.add_subplot(gs[1, 2])
+    style_ax(ax4, "Training Loss History")
+    epochs_logged = np.arange(1, len(history["total"]) + 1) * 500
+    ax4.semilogy(epochs_logged, history["total"], color=ACOL, lw=2,
+                 label="Total")
+    ax4.semilogy(epochs_logged, history["pde"],   color="#3fb950", lw=1.5,
+                 linestyle="--", label="PDE")
+    ax4.semilogy(epochs_logged, history["bc"],    color="#d2a8ff", lw=1.5,
+                 linestyle=":", label="BC")
+    ax4.semilogy(epochs_logged, history["ic"],    color=ECOL, lw=1.5,
+                 linestyle="-.", label="IC")
+    ax4.set_xlabel("Epoch", color=TCOL, fontsize=9)
+    ax4.set_ylabel("MSE Loss", color=TCOL, fontsize=9)
+    leg4 = ax4.legend(fontsize=8, facecolor="#161b22", edgecolor="#30363d",
+                      labelcolor=TCOL)
+
+    fig.suptitle("Physics-Informed Neural Network  ·  1D Heat Equation  "
+                 r"($\partial u/\partial t = \alpha\,\partial^2u/\partial x^2$)",
+                 color=TCOL, fontsize=13, fontweight="bold", y=0.98)
+
+
+#Main
+if __name__ == "__main__":
+    model, history = train()
+    x_vals, t_vals, X, T, u_pred, u_exact, rel_l2 = evaluate(model)
+    plot_results(x_vals, t_vals, X, T, u_pred, u_exact, history, rel_l2)
+
+
+#Saving after training
+torch.save(model.state_dict(), "pinn_heat.pth")
+
+#Reloading and infering
+model = PINN(hidden=64, n_hidden_layers=4).to(device)
+model.load_state_dict(torch.load("pinn_heat.pth", map_location=device))
+model.eval()
+
+
+model.eval()
+with torch.no_grad():
+    x_test = torch.tensor([[0.5]])   # x = 0.5
+    t_test = torch.tensor([[0.25]])  # t = 0.25
+    u_pred = model(x_test.to(device), t_test.to(device))
+
+    # Comparision with analytical solution
+    u_exact = np.sin(np.pi * 0.5) * np.exp(-ALPHA * np.pi**2 * 0.25)
+
+    print(f"PINN prediction : {u_pred.item():.6f}")
+    print(f"Analytical      : {u_exact:.6f}")
+    print(f"Abs error       : {abs(u_pred.item() - u_exact):.6f}")
+
+
+model.eval()
+with torch.no_grad():
+    x_test = torch.linspace(0, 1, 100).unsqueeze(1).to(device)
+    t_test = torch.full((100, 1), 0.5).to(device)   # t = 0.5
+    u_pred = model(x_test, t_test).cpu().numpy()
+
+u_exact = np.sin(np.pi * x_test.cpu().numpy()) * np.exp(-ALPHA * np.pi**2 * 0.5)
+
+import matplotlib.pyplot as plt
+plt.plot(x_test.cpu(), u_exact, label="Analytical")
+plt.plot(x_test.cpu(), u_pred,  label="PINN", linestyle="--")
+plt.legend(); plt.xlabel("x"); plt.ylabel("u"); plt.show()
